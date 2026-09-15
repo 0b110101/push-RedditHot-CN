@@ -29,50 +29,55 @@ def sign(key, msg):
 
 
 def tencent_mps_translate(text, source="auto", target="zh"):
-  """使用腾讯云 TC3-HMAC-SHA256 规范签名直接调用 MPS TextTranslation 接口"""
+  """使用标准 TC3-HMAC-SHA256 签名调用腾讯云 MPS TextTranslation 接口"""
   if not text or not text.strip():
     return ""
 
-  secret_id = TENCENT_SECRET_ID
-  secret_key = TENCENT_SECRET_KEY
+  if not TENCENT_SECRET_ID or not TENCENT_SECRET_KEY:
+    print("错误: 未检测到 TENCENT_SECRET_ID 或 TENCENT_SECRET_KEY 环境变量！")
+    return text
+
   host = "mps.tencentcloudapi.com"
   service = "mps"
   action = "TextTranslation"
   version = "2019-06-12"
 
-  # 1. 组装请求 Payload
+  # 1. 组装请求 Payload (限制在 1800 字符内防止超限)
   payload_dict = {
-      "SourceText": text[:1900],  # 接口限制单次低于 2000 字符
+      "SourceText": text[:1800],
       "Source": source,
       "Target": target,
   }
   payload = json.dumps(payload_dict, ensure_ascii=False)
 
-  # 2. 生成时间戳
+  # 2. 准备时间参数
   timestamp = int(time.time())
   date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
 
-  # 3. 构造 Canonical Request
-  http_request_method = "POST"
-  canonical_uri = "/"
-  canonical_querystring = ""
+  # 3. 构造 Canonical Headers 与 SignedHeaders (严格按照小写字典序排序)
   ct = "application/json; charset=utf-8"
   canonical_headers = (
-      f"content-type:{ct}\nhost:{host}\nx-tc-action:{action.lower()}\n"
+      f"content-type:{ct}\n"
+      f"host:{host}\n"
+      f"x-tc-action:{action.lower()}\n"
+      f"x-tc-timestamp:{timestamp}\n"
+      f"x-tc-version:{version.lower()}\n"
   )
-  signed_headers = "content-type;host;x-tc-action"
+  signed_headers = (
+      "content-type;host;x-tc-action;x-tc-timestamp;x-tc-version"
+  )
   hashed_request_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
   canonical_request = (
-      f"{http_request_method}\n"
-      f"{canonical_uri}\n"
-      f"{canonical_querystring}\n"
+      f"POST\n"
+      f"/\n"
+      f"\n"
       f"{canonical_headers}\n"
       f"{signed_headers}\n"
       f"{hashed_request_payload}"
   )
 
-  # 4. 构造 StringToSign
+  # 4. 拼装 StringToSign
   algorithm = "TC3-HMAC-SHA256"
   credential_scope = f"{date}/{service}/tc3_request"
   hashed_canonical_request = hashlib.sha256(
@@ -85,18 +90,18 @@ def tencent_mps_translate(text, source="auto", target="zh"):
       f"{hashed_canonical_request}"
   )
 
-  # 5. 计算签名
-  secret_date = sign(("TC3" + secret_key).encode("utf-8"), date)
+  # 5. 计算派生密钥与签名
+  secret_date = sign(("TC3" + TENCENT_SECRET_KEY).encode("utf-8"), date)
   secret_service = sign(secret_date, service)
   secret_signing = sign(secret_service, "tc3_request")
   signature = hmac.new(
       secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256
   ).hexdigest()
 
-  # 6. 构造 Authorization
+  # 6. 构造 Authorization 请求头
   authorization = (
       f"{algorithm} "
-      f"Credential={secret_id}/{credential_scope}, "
+      f"Credential={TENCENT_SECRET_ID}/{credential_scope}, "
       f"SignedHeaders={signed_headers}, "
       f"Signature={signature}"
   )
@@ -115,21 +120,25 @@ def tencent_mps_translate(text, source="auto", target="zh"):
         f"https://{host}", headers=headers, data=payload.encode("utf-8"), timeout=10
     )
     res_json = resp.json()
+
+    # 提取返回结果或输出具体报错
     if (
         "Response" in res_json
         and "TargetText" in res_json["Response"]
     ):
       return res_json["Response"]["TargetText"]
     else:
-      print(f"腾讯云 API 返回异常: {res_json}")
+      print(f"腾讯云 API 返回失败原因: {res_json}")
       return text
   except Exception as e:
-    print(f"网络或解析异常: {e}")
+    print(f"请求腾讯云接口发生异常: {e}")
     return text
 
 
 def clean_reddit_summary(html_content):
-  """清洗 Reddit RSS 中的 HTML 标签"""
+  """清洗 Reddit RSS 中的 HTML 标签并保留核心纯文本"""
+  if not html_content:
+    return ""
   soup = BeautifulSoup(html_content, "html.parser")
   for tag in soup.find_all(["a", "img"]):
     tag.replace_with(tag.get_text())
@@ -137,6 +146,15 @@ def clean_reddit_summary(html_content):
   text = soup.get_text(separator="\n").strip()
   text = re.sub(r"submitted by\s+/u/\S+.*", "", text, flags=re.DOTALL)
   return text.strip()
+
+
+def truncate_unicode_text(text, max_len=600):
+  """按 Unicode 码点数（Python 内置 len）严格限制在指定长度以内"""
+  if len(text) > max_len:
+    suffix = "\n\n*(正文超长已截断)*"
+    allowed_len = max(0, max_len - len(suffix))
+    return text[:allowed_len] + suffix
+  return text
 
 
 def main():
@@ -170,7 +188,7 @@ def main():
     if post_id in sent_set:
       continue
 
-    # 滤除早于 2026/09/15 的旧帖
+    # 滤除早于门禁时间的贴子
     pub_time = None
     if hasattr(entry, "published_parsed") and entry.published_parsed:
       pub_time = calendar.timegm(entry.published_parsed)
@@ -183,7 +201,7 @@ def main():
     new_entries.append(entry)
 
   if not new_entries:
-    print("未检测到符合条件的新帖。")
+    print("未检测到符合时间要求的新帖。")
     save_cache(sent_ids)
     return
 
@@ -199,7 +217,7 @@ def main():
         summary_raw[:1500] if summary_raw else "（无正文内容或为纯外链）"
     )
 
-    # 翻译
+    print(f"正在调用翻译 API 处理: {title_raw[:30]}...")
     title_zh = tencent_mps_translate(title_raw, source="auto", target="zh")
     desc_zh = (
         tencent_mps_translate(
@@ -209,13 +227,11 @@ def main():
         else "（无文本内容）"
     )
 
-    # 边界保护与截断
-    title_zh = (title_zh[:250] + "...") if len(title_zh) > 250 else title_zh
-    desc_zh = (
-        (desc_zh[:1800] + "\n\n*(正文过长已截断)*")
-        if len(desc_zh) > 1800
-        else desc_zh
-    )
+    # 标题限制在 250 字符
+    title_zh = (title_zh[:247] + "...") if len(title_zh) > 250 else title_zh
+
+    # 正文严格按 Unicode 码点数限制到 600 字符
+    desc_zh = truncate_unicode_text(desc_zh, max_len=600)
 
     embed = {
         "title": f"🎮 {title_zh}",
@@ -225,7 +241,7 @@ def main():
         "fields": [{
             "name": "📌 原文标题",
             "value": (
-                (title_raw[:250] + "...")
+                (title_raw[:247] + "...")
                 if len(title_raw) > 250
                 else title_raw
             ),
@@ -250,7 +266,7 @@ def main():
       else:
         print(f"Discord 推送失败: {d_resp.status_code} - {d_resp.text}")
     else:
-      print("未配置 DISCORD_WEBHOOK_URL，仅记录。")
+      print("未配置 DISCORD_WEBHOOK_URL，仅本地记录。")
       sent_ids.append(post_id)
       sent_set.add(post_id)
 
