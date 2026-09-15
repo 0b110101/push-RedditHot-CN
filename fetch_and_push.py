@@ -29,10 +29,7 @@ def sign(key, msg):
 
 
 def tencent_translate(text, source="auto", target="zh"):
-  """使用标准 TC3-HMAC-SHA256 签名调用腾讯云原生机器翻译 (TMT) 接口
-
-  注：若你确定使用 MPS，可将 host/service/action/version 换回 mps 并去控制台开通 MPS 服务。
-  """
+  """使用标准 TC3-HMAC-SHA256 签名调用腾讯云原生机器翻译 (TMT) 接口"""
   if not text or not text.strip():
     return ""
 
@@ -40,16 +37,14 @@ def tencent_translate(text, source="auto", target="zh"):
     print("错误: 未检测到 TENCENT_SECRET_ID 或 TENCENT_SECRET_KEY 环境变量！")
     return text
 
-  # 机器翻译原生 TMT 配置
   host = "tmt.tencentcloudapi.com"
   service = "tmt"
   action = "TextTranslate"
   version = "2018-03-21"
-  region = "ap-guangzhou"  # TMT 必须指定地域，通常填 ap-guangzhou 或 ap-beijing
+  region = "ap-guangzhou"
 
-  # 组装请求参数 (单次 1800 字符以内)
   payload_dict = {
-      "SourceText": text[:1800],
+      "SourceText": text,
       "Source": source,
       "Target": target,
       "ProjectId": 0,
@@ -150,7 +145,7 @@ def clean_reddit_summary(html_content):
 
 
 def truncate_unicode_text(text, max_len=600):
-  """按 Unicode 码点数限制到 600 字符，超长直接拼接 '...'"""
+  """按 Unicode 码点数严格限制在 max_len 字符以内，超长直接拼接 '...'"""
   if len(text) > max_len:
     suffix = "..."
     allowed_len = max(0, max_len - len(suffix))
@@ -189,7 +184,7 @@ def main():
     if post_id in sent_set:
       continue
 
-    # 滤除早于门禁时间的贴子
+    # 滤除早于 2026/09/15 的旧帖
     pub_time = None
     if hasattr(entry, "published_parsed") and entry.published_parsed:
       pub_time = calendar.timegm(entry.published_parsed)
@@ -206,7 +201,7 @@ def main():
     save_cache(sent_ids)
     return
 
-  # 3. 逐条翻译并推送
+  # 3. 逐条截断、翻译并推送
   for entry in new_entries:
     post_id = entry.get("id", entry.link)
     title_raw = entry.title
@@ -214,24 +209,26 @@ def main():
         entry.summary if "summary" in entry else ""
     )
 
-    summary_to_translate = (
-        summary_raw[:1500] if summary_raw else "（无正文内容或为纯外链）"
-    )
+    # 【关键修改】：按原文 Unicode 码点数限制到 600 字符，超长在原文直接补 '...'
+    if summary_raw:
+      summary_truncated = truncate_unicode_text(summary_raw, max_len=600)
+    else:
+      summary_truncated = "（无正文内容或为纯外链）"
+
+    # 原文标题截断控制在 250 字符以内
+    title_truncated = truncate_unicode_text(title_raw, max_len=250)
 
     print(f"正在调用翻译 API 处理: {title_raw[:30]}...")
-    title_zh = tencent_translate(title_raw, source="auto", target="zh")
+
+    # 对截断后的原文进行英译中
+    title_zh = tencent_translate(title_truncated, source="auto", target="zh")
     desc_zh = (
-        tencent_translate(summary_to_translate, source="auto", target="zh")
+        tencent_translate(summary_truncated, source="auto", target="zh")
         if summary_raw
         else "（无文本内容）"
     )
 
-    # 标题截断：超长拼接 '...'
-    title_zh = truncate_unicode_text(title_zh, max_len=250)
-
-    # 正文严格按 Unicode 码点数限制到 600 字符，超长拼接 '...'
-    desc_zh = truncate_unicode_text(desc_zh, max_len=600)
-
+    # 构造卡片
     embed = {
         "title": f"🎮 {title_zh}",
         "url": entry.link,
@@ -239,7 +236,7 @@ def main():
         "color": 16729344,
         "fields": [{
             "name": "📌 原文标题",
-            "value": truncate_unicode_text(title_raw, max_len=250),
+            "value": title_truncated,
             "inline": False,
         }],
         "footer": {
