@@ -28,8 +28,11 @@ def sign(key, msg):
   return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def tencent_mps_translate(text, source="auto", target="zh"):
-  """使用标准 TC3-HMAC-SHA256 签名调用腾讯云 MPS TextTranslation 接口"""
+def tencent_translate(text, source="auto", target="zh"):
+  """使用标准 TC3-HMAC-SHA256 签名调用腾讯云原生机器翻译 (TMT) 接口
+
+  注：若你确定使用 MPS，可将 host/service/action/version 换回 mps 并去控制台开通 MPS 服务。
+  """
   if not text or not text.strip():
     return ""
 
@@ -37,24 +40,25 @@ def tencent_mps_translate(text, source="auto", target="zh"):
     print("错误: 未检测到 TENCENT_SECRET_ID 或 TENCENT_SECRET_KEY 环境变量！")
     return text
 
-  host = "mps.tencentcloudapi.com"
-  service = "mps"
-  action = "TextTranslation"
-  version = "2019-06-12"
+  # 机器翻译原生 TMT 配置
+  host = "tmt.tencentcloudapi.com"
+  service = "tmt"
+  action = "TextTranslate"
+  version = "2018-03-21"
+  region = "ap-guangzhou"  # TMT 必须指定地域，通常填 ap-guangzhou 或 ap-beijing
 
-  # 1. 组装请求 Payload (限制在 1800 字符内防止超限)
+  # 组装请求参数 (单次 1800 字符以内)
   payload_dict = {
       "SourceText": text[:1800],
       "Source": source,
       "Target": target,
+      "ProjectId": 0,
   }
   payload = json.dumps(payload_dict, ensure_ascii=False)
 
-  # 2. 准备时间参数
   timestamp = int(time.time())
   date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
 
-  # 3. 构造 Canonical Headers 与 SignedHeaders (严格按照小写字典序排序)
   ct = "application/json; charset=utf-8"
   canonical_headers = (
       f"content-type:{ct}\n"
@@ -77,7 +81,6 @@ def tencent_mps_translate(text, source="auto", target="zh"):
       f"{hashed_request_payload}"
   )
 
-  # 4. 拼装 StringToSign
   algorithm = "TC3-HMAC-SHA256"
   credential_scope = f"{date}/{service}/tc3_request"
   hashed_canonical_request = hashlib.sha256(
@@ -90,7 +93,6 @@ def tencent_mps_translate(text, source="auto", target="zh"):
       f"{hashed_canonical_request}"
   )
 
-  # 5. 计算派生密钥与签名
   secret_date = sign(("TC3" + TENCENT_SECRET_KEY).encode("utf-8"), date)
   secret_service = sign(secret_date, service)
   secret_signing = sign(secret_service, "tc3_request")
@@ -98,7 +100,6 @@ def tencent_mps_translate(text, source="auto", target="zh"):
       secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256
   ).hexdigest()
 
-  # 6. 构造 Authorization 请求头
   authorization = (
       f"{algorithm} "
       f"Credential={TENCENT_SECRET_ID}/{credential_scope}, "
@@ -113,6 +114,7 @@ def tencent_mps_translate(text, source="auto", target="zh"):
       "X-TC-Action": action,
       "X-TC-Timestamp": str(timestamp),
       "X-TC-Version": version,
+      "X-TC-Region": region,
   }
 
   try:
@@ -121,7 +123,6 @@ def tencent_mps_translate(text, source="auto", target="zh"):
     )
     res_json = resp.json()
 
-    # 提取返回结果或输出具体报错
     if (
         "Response" in res_json
         and "TargetText" in res_json["Response"]
@@ -136,7 +137,7 @@ def tencent_mps_translate(text, source="auto", target="zh"):
 
 
 def clean_reddit_summary(html_content):
-  """清洗 Reddit RSS 中的 HTML 标签并保留核心纯文本"""
+  """清洗 Reddit RSS 中的 HTML 标签"""
   if not html_content:
     return ""
   soup = BeautifulSoup(html_content, "html.parser")
@@ -149,9 +150,9 @@ def clean_reddit_summary(html_content):
 
 
 def truncate_unicode_text(text, max_len=600):
-  """按 Unicode 码点数（Python 内置 len）严格限制在指定长度以内"""
+  """按 Unicode 码点数限制到 600 字符，超长直接拼接 '...'"""
   if len(text) > max_len:
-    suffix = "\n\n*(正文超长已截断)*"
+    suffix = "..."
     allowed_len = max(0, max_len - len(suffix))
     return text[:allowed_len] + suffix
   return text
@@ -218,19 +219,17 @@ def main():
     )
 
     print(f"正在调用翻译 API 处理: {title_raw[:30]}...")
-    title_zh = tencent_mps_translate(title_raw, source="auto", target="zh")
+    title_zh = tencent_translate(title_raw, source="auto", target="zh")
     desc_zh = (
-        tencent_mps_translate(
-            summary_to_translate, source="auto", target="zh"
-        )
+        tencent_translate(summary_to_translate, source="auto", target="zh")
         if summary_raw
         else "（无文本内容）"
     )
 
-    # 标题限制在 250 字符
-    title_zh = (title_zh[:247] + "...") if len(title_zh) > 250 else title_zh
+    # 标题截断：超长拼接 '...'
+    title_zh = truncate_unicode_text(title_zh, max_len=250)
 
-    # 正文严格按 Unicode 码点数限制到 600 字符
+    # 正文严格按 Unicode 码点数限制到 600 字符，超长拼接 '...'
     desc_zh = truncate_unicode_text(desc_zh, max_len=600)
 
     embed = {
@@ -240,11 +239,7 @@ def main():
         "color": 16729344,
         "fields": [{
             "name": "📌 原文标题",
-            "value": (
-                (title_raw[:247] + "...")
-                if len(title_raw) > 250
-                else title_raw
-            ),
+            "value": truncate_unicode_text(title_raw, max_len=250),
             "inline": False,
         }],
         "footer": {
